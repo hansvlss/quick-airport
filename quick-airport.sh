@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 # quick-airport.sh
-# 4 合 1（VLESS Reality / Trojan / VMess-WS+TLS / Hysteria2）
-# 证书由 Caddy 自动签发；订阅以静态文件 /sub/source.txt 提供
-# 运行示例：
-#   DOMAIN="vpn.example.com" EMAIL="me@example.com" bash quick-airport.sh
+# 4 合 1（VLESS Reality / Trojan / VMess-WS+TLS / Hysteria2）一键部署
+# - 证书由 Caddy 自动签发
+# - 订阅以静态文件 /sub/source.txt 提供
+# - 运行前：传入环境变量 DOMAIN=你的域名.com （EMAIL 可选）
+#   例：DOMAIN="vpn.example.com" EMAIL="me@example.com" bash quick-airport.sh
 
 set -euo pipefail
 
 #========================== 基础变量 ==========================#
 DOMAIN="${DOMAIN:-}"
-EMAIL="${EMAIL:-}"                       # 可留空
-HY2_PORT="${HY2_PORT:-8445}"             # UDP
+EMAIL="${EMAIL:-}"                 # 可留空
+HY2_PORT="${HY2_PORT:-8445}"       # UDP
 VLESS_PORT="${VLESS_PORT:-8442}"
 TROJAN_PORT="${TROJAN_PORT:-8443}"
 VMESS_PORT="${VMESS_PORT:-8444}"
 
 SB_BIN="/usr/local/bin/sing-box"
 CADDY_BIN="/usr/bin/caddy"
+CADDYFILE="/etc/caddy/Caddyfile"
 WEBROOT="/var/www"
 SUB_DIR="$WEBROOT/sub"
 ENV_FILE="/root/airport.env"
@@ -31,106 +33,94 @@ trap 'die "脚本异常中止。日志见：$LOG"' ERR
 
 [[ -z "$DOMAIN" ]] && die "未传入 DOMAIN。示例：DOMAIN=\"vpn.example.com\" bash $0"
 
-#========================== 自检 1：网络与域名 ==========================#
-log "自检：解析 $DOMAIN"
-IPV4_LOCAL="$(curl -fsS --max-time 5 https://ipinfo.io/ip || true)"
-IPV4_DNS="$(dig +short A "$DOMAIN" | tr '\n' ' ' || true)"
-[[ -z "${IPV4_DNS// }" ]] && die "域名 $DOMAIN 未解析到 A 记录。请先在 DNS 面板添加 A 记录到本机 IP（灰云）。"
-
-if [[ -n "$IPV4_LOCAL" ]] && ! grep -qw "$IPV4_LOCAL" <(echo "$IPV4_DNS"); then
-  log "警告：域名解析($IPV4_DNS)与本机公网 IP($IPV4_LOCAL)不一致。若是多IP或中转请确认可达。"
+#========================== 0) DNS 自救（仅当无法解析时） ==========================#
+if ! ping -c1 -W2 github.com >/dev/null 2>&1; then
+  log "检测到 DNS 解析异常，临时写入 /etc/resolv.conf"
+  echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf || true
 fi
-log "DNS A: $IPV4_DNS  | 本机: ${IPV4_LOCAL:-unknown}"
 
-#========================== 自检 2：端口占用 ==========================#
-for p in 80 443; do
-  if ss -tunlp | grep -qE ":${p}\b"; then
-    log "端口 $p 已被占用，将尝试用 Caddy 接管（如非预期请先释放）。"
-  fi
-done
-
-#========================== 1) 基础环境 / 时区 / BBR / UFW ==========================#
+#========================== 1) 基础软件/时区/时间同步/BBR/UFW ==========================#
 log "安装基础软件 & 设置时区/时间同步/BBR/UFW"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl wget jq tar unzip socat ufw chrony ca-certificates gnupg lsb-release dnsutils net-tools
+apt-get install -y ca-certificates curl wget jq tar coreutils gnupg lsb-release chrony ufw net-tools dnsutils
 
-# 时区与时间同步
+# 时区 & 时间同步
 timedatectl set-timezone Asia/Shanghai || true
 systemctl enable --now chrony || true
 timedatectl set-ntp true || true
 
 # BBR
-if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-  cat >/etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-fi
-log "BBR: $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')"
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -w net.core.default_qdisc=fq >/dev/null
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+grep -q "net.core.default_qdisc" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+grep -q "net.ipv4.tcp_congestion_control" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+ok "$(sysctl net.core.default_qdisc | tr -s ' ')"
+ok "$(sysctl net.ipv4.tcp_congestion_control | tr -s ' ')"
 
 # UFW
 ufw --force reset || true
 ufw default deny incoming
 ufw default allow outgoing
+ufw allow 22/tcp || true
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw allow 443/udp
-ufw allow "${VLESS_PORT}"/tcp
-ufw allow "${TROJAN_PORT}"/tcp
-ufw allow "${VMESS_PORT}"/tcp
-ufw allow "${HY2_PORT}"/udp
+ufw allow ${VLESS_PORT}/tcp
+ufw allow ${TROJAN_PORT}/tcp
+ufw allow ${VMESS_PORT}/tcp
+ufw allow ${HY2_PORT}/udp
 ufw --force enable
 ok "[OK] UFW 已启用。放行端口：80/tcp, 443/tcp, 443/udp, ${VLESS_PORT}/tcp, ${TROJAN_PORT}/tcp, ${VMESS_PORT}/tcp, ${HY2_PORT}/udp"
 
-#========================== 2) 安装 Caddy（带 GPG 修复 & 回退） ==========================#
-log "安装 Caddy（优先 APT，失败则 .deb 回退）"
-install_caddy_by_apt(){
-  install -d /usr/share/keyrings
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    | tee /etc/apt/sources.list.d/caddy.list
-  apt-get update -y
-  apt-get install -y caddy
-}
-if ! command -v caddy >/dev/null 2>&1; then
-  if ! install_caddy_by_apt; then
-    log "APT 安装失败，尝试 .deb 直装回退"
-    TMPD="$(mktemp -d)"
-    cd "$TMPD"
-    DEB_URL="https://github.com/caddyserver/caddy/releases/download/v2.7.6/caddy_2.7.6_linux_amd64.deb"
-    curl -fL --retry 3 -o caddy.deb "$DEB_URL"
-    apt-get install -y ./caddy.deb
-    cd /root && rm -rf "$TMPD"
-  fi
-fi
-ok "Caddy 已安装：$(caddy version || echo unknown)"
+#========================== 2) 安装 Caddy（APT 源，含 GPG Key 修复） ==========================#
+log "安装 Caddy（APT）"
+install -d /usr/share/keyrings /etc/apt/sources.list.d
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 
-#========================== 3) 配置 Caddy 静态站 ==========================#
-install -d "$WEBROOT" "$SUB_DIR"
-cat > /etc/caddy/Caddyfile <<EOF
+cat >/etc/apt/sources.list.d/caddy-stable.list <<'LIST'
+deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main
+deb-src [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main
+LIST
+
+apt-get update -y || {
+  # 若再次提示 NO_PUBKEY，重新写 key 再试一次
+  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  apt-get update -y
+}
+apt-get install -y caddy
+
+#========================== 3) 最简 Caddyfile & Web 根目录 ==========================#
+install -d "$WEBROOT" "$SUB_DIR" /etc/caddy
+cat >"$CADDYFILE" <<CADDY
 ${DOMAIN} {
     encode zstd gzip
     root * ${WEBROOT}
     file_server
 }
-EOF
+CADDY
 
-# 放一个最简单的首页与订阅占位
-cat > "${WEBROOT}/index.html" <<'HTML'
+# 一个简单首页，带订阅入口
+cat >"${WEBROOT}/index.html" <<HTML
 <!doctype html><meta charset="utf-8"><title>OK</title>
 <h1>Caddy OK</h1>
 <p>订阅地址：<a href="/sub/source.txt">/sub/source.txt</a></p>
 HTML
 
-cat > "${SUB_DIR}/source.txt" <<'SUB'
-# 脚本稍后会覆盖此文件为四合一订阅
-SUB
+# 先放个占位订阅，稍后回填
+echo "# 正在初始化，请稍候…" > "${SUB_DIR}/source.txt"
 
-chown -R www-data:www-data "$WEBROOT" || true
-caddy validate --config /etc/caddy/Caddyfile
+# 设定邮箱（可选）
+if [[ -n "$EMAIL" ]]; then
+  sed -i '/^#.*email/c\' /etc/caddy/Caddyfile 2>/dev/null || true
+  # Caddyfile 顶部 email directive（可选，不加也能签）
+  sed -i "1i email ${EMAIL}" "$CADDYFILE"
+fi
+
+caddy validate --config "$CADDYFILE"
 systemctl enable --now caddy
 log "等待 Let's Encrypt 证书颁发…"
 sleep 3
@@ -146,19 +136,21 @@ case "$ARCH_RAW" in
   *) die "不支持的架构: $ARCH_RAW" ;;
 esac
 
-if ! command -v sing-box >/dev/null 2>&1; then
-  VER="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)"
-  FILE_VER="${VER#v}"
-  URL="https://github.com/SagerNet/sing-box/releases/download/${VER}/sing-box-${FILE_VER}-linux-${SB_ARCH}.tar.gz"
-  TMP_DIR="$(mktemp -d)"; cd "$TMP_DIR"
-  curl -fL --retry 3 -o sb.tgz "$URL"
-  tar -xzf sb.tgz
-  install -m0755 sing-box-*/sing-box /usr/local/bin/sing-box
-  cd /root && rm -rf "$TMP_DIR"
-fi
-ok "$($SB_BIN version | head -n1 || echo sing-box)"
+VER="$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)"
+[[ -z "$VER" || "$VER" == "null" ]] && die "获取 sing-box 最新版本失败"
+FILE_VER="${VER#v}"
+URL="https://github.com/SagerNet/sing-box/releases/download/${VER}/sing-box-${FILE_VER}-linux-${SB_ARCH}.tar.gz"
 
-#========================== 5) 生成密钥 & 环境变量 ==========================#
+TMP_DIR="$(mktemp -d)"
+pushd "$TMP_DIR" >/dev/null
+curl -fL --retry 3 -o sb.tgz "$URL"
+tar -xzf sb.tgz
+install -m 0755 sing-box-*/sing-box "$SB_BIN"
+popd >/dev/null
+rm -rf "$TMP_DIR"
+$SB_BIN version | tee -a "$LOG" | sed -n '1p' | xargs -I{} ok "{}"
+
+#========================== 5) 生成凭据 & 写入 config.json ==========================#
 log "生成凭据"
 KP="$($SB_BIN generate reality-keypair)"
 REALITY_PRIV="$(echo "$KP" | awk '/PrivateKey/{print $2}')"
@@ -169,9 +161,8 @@ HY2_PASS="$(openssl rand -hex 16)"
 HY2_OBFS="$(openssl rand -hex 16)"
 TROJAN_PASS="$(openssl rand -hex 16)"
 
-cat > "$ENV_FILE" <<EOF
+cat >"$ENV_FILE" <<EOF
 DOMAIN="${DOMAIN}"
-EMAIL="${EMAIL}"
 UUID="${UUID}"
 REALITY_PRIV="${REALITY_PRIV}"
 REALITY_PUB="${REALITY_PUB}"
@@ -186,9 +177,9 @@ VMESS_PORT="${VMESS_PORT}"
 EOF
 chmod 600 "$ENV_FILE"
 
-#========================== 6) 写入 sing-box 配置（证书路径稍后回填） ==========================#
 log "写入 sing-box 配置与服务"
 install -d /etc/sing-box
+
 cat > /etc/sing-box/config.json <<JSON
 {
   "log": { "level": "warn" },
@@ -211,8 +202,8 @@ cat > /etc/sing-box/config.json <<JSON
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
-        "certificate_path": "/__caddy_cert_placeholder__/fullchain.crt",
-        "key_path": "/__caddy_cert_placeholder__/private.key"
+        "certificate_path": "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.crt",
+        "key_path": "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.key"
       }
     },
     {
@@ -239,8 +230,8 @@ cat > /etc/sing-box/config.json <<JSON
         "enabled": true,
         "alpn": ["h2","http/1.1"],
         "server_name": "${DOMAIN}",
-        "certificate_path": "/__caddy_cert_placeholder__/fullchain.crt",
-        "key_path": "/__caddy_cert_placeholder__/private.key"
+        "certificate_path": "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.crt",
+        "key_path": "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.key"
       }
     },
     {
@@ -252,72 +243,76 @@ cat > /etc/sing-box/config.json <<JSON
       "tls": {
         "enabled": true,
         "server_name": "${DOMAIN}",
-        "certificate_path": "/__caddy_cert_placeholder__/fullchain.crt",
-        "key_path": "/__caddy_cert_placeholder__/private.key"
+        "certificate_path": "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.crt",
+        "key_path": "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.key"
       }
     }
   ],
 
-  "outbounds": [
-    { "type": "direct" },
-    { "type": "block" }
-  ]
+  "outbounds": [{ "type": "direct" }, { "type": "block" }]
 }
 JSON
 
-cat > /etc/systemd/system/sing-box.service <<'UNIT'
+cat > /etc/systemd/system/sing-box.service <<SVC
 [Unit]
 Description=Sing-box
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecStart=${SB_BIN} run -c /etc/sing-box/config.json
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+SVC
 
-#========================== 7) 等证书并回填路径 ==========================#
+systemctl daemon-reload
+$SB_BIN check -c /etc/sing-box/config.json
+systemctl enable --now sing-box
+
+#========================== 6) 等证书并“回填路径” & 生成订阅 ==========================#
 log "定位 Caddy 证书"
 CERT_BASE="/var/lib/caddy/.local/share/caddy"
-CRT_PATH=""
-KEY_PATH=""
-
+CRT_PATH=""; KEY_PATH=""
 for i in {1..18}; do
-  CRT_PATH="$(find "$CERT_BASE" -type f -path "*/${DOMAIN}/${DOMAIN}.crt" 2>/dev/null | head -n1 || true)"
-  KEY_PATH="$(find "$CERT_BASE" -type f -path "*/${DOMAIN}/${DOMAIN}.key" 2>/dev/null | head -n1 || true)"
-  [[ -z "$KEY_PATH" ]] && KEY_PATH="$(find "$CERT_BASE/keys" -type f -path "*/${DOMAIN}/${DOMAIN}.key" 2>/dev/null | head -n1 || true)"
-  if [[ -f "$CRT_PATH" && -f "$KEY_PATH" ]]; then break; fi
+  CRT_PATH="$(find "$CERT_BASE" -type f -path "*/${DOMAIN}/${DOMAIN}.crt" -print -quit 2>/dev/null || true)"
+  KEY_PATH="$(find "$CERT_BASE/certificates" -type f -path "*/${DOMAIN}/${DOMAIN}.key" -print -quit 2>/dev/null || true)"
+  [[ -z "$KEY_PATH" ]] && KEY_PATH="$(find "$CERT_BASE/keys" -type f -path "*/${DOMAIN}/${DOMAIN}.key" -print -quit 2>/dev/null || true)"
+  [[ -f "$CRT_PATH" && -f "$KEY_PATH" ]] && break
+  # 主动触发访问，促进自动签发
+  curl -skI "https://${DOMAIN}/" >/dev/null 2>&1 || true
   sleep 10
 done
 
 if [[ ! -f "$CRT_PATH" || ! -f "$KEY_PATH" ]]; then
-  die "仍未找到证书：/var/lib/caddy/.local/share/caddy/.../${DOMAIN}/{.crt,.key}。请确认 DNS 已生效且为灰云。查看：journalctl -u caddy -n 100 --no-pager"
+  die "仍未找到证书：/var/lib/caddy/.local/share/caddy/.../${DOMAIN}/{.crt,.key}。请确认 DNS 已生效且为灰云。\n查看：journalctl -u caddy -n 100 --no-pager"
 fi
-ok "证书已就绪"
+ok "证书已找到：$CRT_PATH | $KEY_PATH"
 
-# 回填配置中的证书占位路径
+# 用 jq 回填（以防 Caddy 目录结构差异）
 jq \
   --arg crt "$CRT_PATH" \
   --arg key "$KEY_PATH" \
-  '(.inbounds[] | select(has("tls") and .tls.enabled==true) | .tls.certificate_path) |= $crt
-   | (.inbounds[] | select(has("tls") and .tls.enabled==true) | .tls.key_path) |= $key' \
-  /etc/sing-box/config.json > /etc/sing-box/config.json.new
+  '.inbounds |= map(
+     if .type=="hysteria2" or .type=="trojan" or (.type=="vmess" and (.tls//{}).enabled==true)
+     then .tls.certificate_path=$crt | .tls.key_path=$key
+     else .
+     end
+   )' /etc/sing-box/config.json > /etc/sing-box/config.json.new
+
 mv /etc/sing-box/config.json.new /etc/sing-box/config.json
-
-# 校验并启动
 $SB_BIN check -c /etc/sing-box/config.json
-systemctl daemon-reload
-systemctl enable --now sing-box
+systemctl restart sing-box
+sleep 1
 
-#========================== 8) 生成四合一订阅 ==========================#
-log "生成订阅链接"
-VMESS_JSON=$(cat <<JSON
+# 重新生成订阅（以实际端口/密钥）
+set -a; source "$ENV_FILE"; set +a
+
+VMESS_JSON=$(cat <<EOJ
 {"v":"2","ps":"VMess-WS-TLS","add":"${DOMAIN}","port":"${VMESS_PORT}","id":"${UUID}","aid":"0","net":"ws","type":"","host":"${DOMAIN}","path":"/vmess","tls":"tls","sni":"${DOMAIN}"}
-JSON
+EOJ
 )
 VMESS_B64="$(echo -n "$VMESS_JSON" | base64 -w 0)"
 HY2="hysteria2://${HY2_PASS}@${DOMAIN}:${HY2_PORT}/?obfs=salamander&obfsParam=${HY2_OBFS}&peer=${DOMAIN}&alpn=h3#HY2"
@@ -325,7 +320,6 @@ TROJAN="trojan://${TROJAN_PASS}@${DOMAIN}:${TROJAN_PORT}?peer=${DOMAIN}&alpn=h2,
 VLESS="vless://${UUID}@${DOMAIN}:${VLESS_PORT}?encryption=none&flow=&type=tcp&security=reality&pbk=${REALITY_PUB}&sid=${REALITY_SID}&sni=www.cloudflare.com#VLESS-REALITY"
 VMESS="vmess://${VMESS_B64}"
 
-install -d "$SUB_DIR"
 cat > "${SUB_DIR}/source.txt" <<EOF
 $HY2
 $TROJAN
@@ -333,18 +327,23 @@ $VLESS
 $VMESS
 EOF
 
-chown -R www-data:www-data "$WEBROOT" || true
+# 站点权限 & Reload
+chown -R caddy:caddy "$WEBROOT" 2>/dev/null || chown -R www-data:www-data "$WEBROOT" || true
 systemctl reload caddy || true
 
-#========================== 9) 完成 & 输出 ==========================#
+#========================== 完成 & 提示 ==========================#
 ok "部署完成！"
-echo "——————————————————————————————"
+echo "——————————————————————————————————"
 echo "订阅地址： https://${DOMAIN}/sub/source.txt"
 echo "HY2:     $HY2"
 echo "Trojan:  $TROJAN"
 echo "VLESS:   $VLESS"
 echo "VMess:   $VMESS"
 echo
-echo "Sing-box 日志：journalctl -u sing-box -n 50 --no-pager"
-echo "Caddy   日志：journalctl -u caddy -n 50 --no-pager"
-echo "环境变量保存在：$ENV_FILE"
+echo "端口监听："
+ss -tunlp | grep -E ":${VLESS_PORT}|:${TROJAN_PORT}|:${VMESS_PORT}|:${HY2_PORT}|:443\\b" || true
+echo
+echo "如有问题，请执行："
+echo "journalctl -u caddy -n 80 --no-pager"
+echo "journalctl -u sing-box -n 80 --no-pager"
+echo "环境变量保存于：$ENV_FILE"
